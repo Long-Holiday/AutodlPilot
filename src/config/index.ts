@@ -18,11 +18,11 @@ const configSchema = z.object({
   // SQLite 数据库路径
   DATABASE_PATH: z.string().default('./data/autodl-pilot.db'),
 
-  // 持续开机调度器配置
+  // 持续开机调度器配置（支持最长 2 小时持续重试与退避配合）
   RETRY_INITIAL_INTERVAL_SEC: z.coerce.number().positive().default(10),
-  RETRY_MAX_INTERVAL_SEC: z.coerce.number().positive().default(60),
+  RETRY_MAX_INTERVAL_SEC: z.coerce.number().positive().default(120),
   RETRY_BACKOFF_FACTOR: z.coerce.number().min(1.0).default(1.5),
-  RETRY_MAX_DURATION_MINUTES: z.coerce.number().positive().default(60),
+  RETRY_MAX_DURATION_MINUTES: z.coerce.number().positive().default(120),
 
   // 开机后实例运行状态轮询配置
   POLL_STATUS_INTERVAL_SEC: z.coerce.number().positive().default(5),
