@@ -1,0 +1,18 @@
+[Unit]
+Description=AutoDL Pilot MCP Remote Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/autodl-pilot
+EnvironmentFile=/opt/autodl-pilot/.env
+ExecStart=/usr/bin/node /opt/autodl-pilot/dist/index.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
