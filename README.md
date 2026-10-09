@@ -141,7 +141,18 @@ MCP 为无状态 **Streamable HTTP**：每个 POST 创建独立 server/transport
 
 ### systemd（Linux）
 
-在远程服务器上准备系统级 `/usr/bin/node`（推荐 Node 24 LTS）、npm、编译工具及 systemd 后：
+在远程服务器上准备 Node >=24（推荐 Node 24 LTS）、npm、编译工具及 systemd 后执行。支持系统安装和个人 nvm 安装：部署脚本识别真实路径，将 Node 二进制及 npm 包复制为 `/opt/autodl-pilot/runtime` 下的独立运行环境，构建和 systemd 都使用该副本。
+
+**不要把个人目录中的 Node/npm 链接到 `/usr/bin`，也不要为服务放开家目录权限。** 链接不改变目录访问权限，`ProtectHome=true` 也会屏蔽个人安装目录。若 `sudo` 清理了 PATH，可显式传入当前安装路径：
+
+```bash
+sudo env \
+  NODE_BIN="$(node -p 'process.execPath')" \
+  NPM_CLI="$(readlink -f "$(command -v npm)")" \
+  bash scripts/setup-remote.sh
+```
+
+也可直接运行，让脚本优先查找 sudo 调用者的常规 nvm 安装，然后查找 PATH：
 
 ```bash
 sudo bash scripts/setup-remote.sh
@@ -150,7 +161,7 @@ sudo systemctl enable --now autodl-mcp
 sudo journalctl -u autodl-mcp -f
 ```
 
-脚本默认只准备部署，不启用服务；源项目 `.env` 在目标尚无配置时才复制，否则复制模板。数据目录归服务用户 `autodl-pilot` 所有，构建以非 root 用户在独立 staging 目录执行，不包含数据库或密钥。旧产物保留在输出的 staging 路径，确认后自行清理。
+脚本默认只准备部署，不启用服务；源项目 `.env` 在目标尚无配置时才复制，否则复制模板。数据目录归服务用户 `autodl-pilot` 所有，构建以非 root 用户在独立 staging 目录执行，不包含数据库或密钥。独立 runtime 和代码归 root 所有，服务用户只读，保留 `ProtectHome=true`；无需访问个人 nvm 目录。旧代码和 runtime 产物保留在输出的 staging 路径，确认后自行清理。升级个人 Node/npm 后重新运行部署脚本，服务副本不会随 nvm 切换自动改变。
 
 已在运行的服务只能显式使用 `sudo bash scripts/setup-remote.sh --start` 停止、更新和重启。模板仅允许写入默认 `data/`；若自定义数据库目录，同时调整 `ReadWritePaths` 和目录权限。`HOST` 若在已有 `.env` 中配置为 `0.0.0.0`，不会自动改写；部署前请检查监听和防火墙。
 

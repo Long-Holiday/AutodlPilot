@@ -6,8 +6,9 @@ set -euo pipefail
 SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 DEPLOY_DIR=/opt/autodl-pilot
 SERVICE_USER=autodl-pilot
-[[ -x /usr/bin/node && -x /usr/bin/npm ]] || { printf '请先安装系统级 Node 24 LTS 与 npm（/usr/bin），本脚本不执行远程安装脚本\n' >&2; exit 1; }
-/usr/bin/node -e 'if (Number(process.versions.node.split(".")[0]) < 24) { console.error("需要 Node >=24，推荐 Node 24 LTS"); process.exit(1); }'
+source "$SOURCE_DIR/scripts/deploy-runtime.sh"
+resolve_node_runtime
+printf '使用 Node: %s\n使用 npm: %s\n' "$NODE_SOURCE" "$NPM_SOURCE"
 command -v runuser >/dev/null
 command -v systemctl >/dev/null
 if systemctl is-active --quiet autodl-mcp && [[ "${1:-}" != '--start' ]]; then
@@ -21,9 +22,21 @@ fi
 
 # 在独立 staging 目录构建，不复制 .env、数据库、.git 或本机密钥。
 BUILD_DIR=$(mktemp -d /opt/autodl-pilot-build.XXXXXX)
+RUNTIME_STAGE=$(mktemp -d /opt/autodl-pilot-runtime.XXXXXX)
+prepare_node_runtime "$RUNTIME_STAGE"
 cp -R "$SOURCE_DIR/src" "$SOURCE_DIR/package.json" "$SOURCE_DIR/package-lock.json" "$SOURCE_DIR/tsconfig.json" "$BUILD_DIR/"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$BUILD_DIR"
-runuser -u "$SERVICE_USER" -- env HOME="$BUILD_DIR" PATH=/usr/bin:/bin npm_config_cache="$BUILD_DIR/.npm-cache" bash -c 'set -e; cd -- "$1"; /usr/bin/npm ci; /usr/bin/npm run build; /usr/bin/npm prune --omit=dev' _ "$BUILD_DIR"
+# 先以实际服务用户验证独立 runtime；不会沿 /usr/bin 的链接进入个人目录。
+runuser -u "$SERVICE_USER" -- env PATH="$RUNTIME_STAGE/bin:/usr/bin:/bin" "$RUNTIME_STAGE/bin/node" "$RUNTIME_STAGE/lib/node_modules/npm/bin/npm-cli.js" --version
+runuser -u "$SERVICE_USER" -- env HOME="$BUILD_DIR" PATH="$RUNTIME_STAGE/bin:/usr/bin:/bin" npm_config_cache="$BUILD_DIR/.npm-cache" bash -c '
+    set -e
+    cd -- "$1"
+    node_exe="$2/bin/node"
+    npm_cli="$2/lib/node_modules/npm/bin/npm-cli.js"
+    "$node_exe" "$npm_cli" ci
+    "$node_exe" "$npm_cli" run build
+    "$node_exe" "$npm_cli" prune --omit=dev
+' _ "$BUILD_DIR" "$RUNTIME_STAGE"
 
 if [[ "${1:-}" == '--start' ]] && systemctl is-active --quiet autodl-mcp; then
     systemctl stop autodl-mcp
@@ -32,6 +45,9 @@ install -d -m 755 "$DEPLOY_DIR"
 install -d -m 750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DEPLOY_DIR/data"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$DEPLOY_DIR/data"
 # 保留上一版产物，避免不可恢复地覆盖；历史数据库和 .env 始终保留。
+if [[ -e "$DEPLOY_DIR/runtime" ]]; then mv "$DEPLOY_DIR/runtime" "$BUILD_DIR/previous-runtime"; fi
+mv "$RUNTIME_STAGE" "$DEPLOY_DIR/runtime"
+chown -R root:root "$DEPLOY_DIR/runtime"
 for DIR in dist node_modules; do
     if [[ -e "$DEPLOY_DIR/$DIR" ]]; then mv "$DEPLOY_DIR/$DIR" "$BUILD_DIR/previous-$DIR"; fi
     mv "$BUILD_DIR/$DIR" "$DEPLOY_DIR/$DIR"
@@ -52,7 +68,7 @@ systemctl daemon-reload
 printf '部署文件已准备；构建/旧产物保留于 %s，确认后可自行清理。\n' "$BUILD_DIR"
 
 if [[ "${1:-}" == '--start' ]]; then
-    runuser -u "$SERVICE_USER" -- /usr/bin/node --input-type=module -e '
+    runuser -u "$SERVICE_USER" -- "$DEPLOY_DIR/runtime/bin/node" --input-type=module -e '
       const { loadConfig } = await import("/opt/autodl-pilot/dist/config/index.js");
       const config = loadConfig();
       if (config.AUTODL_TOKEN.startsWith("your_") || config.MCP_AUTH_TOKEN.startsWith("your_")) {

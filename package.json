@@ -12,7 +12,7 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
-    "check:shell": "for script in scripts/local/*.sh scripts/setup-remote.sh; do bash -n \"$script\" || exit 1; done",
+    "check:shell": "for script in scripts/local/*.sh scripts/*.sh; do bash -n \"$script\" || exit 1; done",
     "test": "vitest run"
   },
   "keywords": [

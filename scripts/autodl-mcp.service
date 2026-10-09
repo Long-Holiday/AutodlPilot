@@ -9,7 +9,8 @@ User=autodl-pilot
 Group=autodl-pilot
 WorkingDirectory=/opt/autodl-pilot
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/node /opt/autodl-pilot/dist/index.js
+Environment=PATH=/opt/autodl-pilot/runtime/bin:/usr/bin:/bin
+ExecStart=/opt/autodl-pilot/runtime/bin/node /opt/autodl-pilot/dist/index.js
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=35
