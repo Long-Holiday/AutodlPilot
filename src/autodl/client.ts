@@ -1,18 +1,8 @@
-import { logger } from '../logger/index.js';
-import {
-  AutoDLApiResponse,
-  RawInstanceSnapshot,
-  SafeInstanceSnapshot,
-  InstanceListItem,
-  InstanceListResult,
-  WalletBalance,
-} from './types.js';
-import {
-  AutoDLError,
-  AutoDLNonRetryableError,
-  AutoDLRetryableError,
-  classifyAutoDLError,
-} from './errors.js';
+import http from 'node:http';
+import https from 'node:https';
+import { z } from 'zod';
+import { AutoDLApiResponse, InstanceApi, SafeInstanceSnapshot } from './types.js';
+import { AutoDLError, AutoDLNonRetryableError, AutoDLRetryableError, businessError } from './errors.js';
 
 export interface AutoDLClientOptions {
   baseUrl: string;
@@ -20,240 +10,171 @@ export interface AutoDLClientOptions {
   timeoutMs?: number;
 }
 
-export class AutoDLClient {
-  private readonly baseUrl: string;
+const envelopeSchema = z.object({
+  code: z.string().min(1),
+  msg: z.string(),
+  data: z.unknown(),
+  request_id: z.string().optional(),
+});
+const connectionSchema = z.object({
+  proxy_host: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9.-]*$/).max(253),
+  ssh_port: z.number().int().min(1).max(65535),
+});
+const networkCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE']);
+
+export class AutoDLClient implements InstanceApi {
+  private readonly baseUrl: URL;
   private readonly token: string;
   private readonly timeoutMs: number;
 
   constructor(options: AutoDLClientOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/+$/, '');
+    this.baseUrl = new URL(options.baseUrl);
+    if (!['https:', 'http:'].includes(this.baseUrl.protocol) || this.baseUrl.username || this.baseUrl.password) {
+      throw new Error('AUTODL_BASE_URL 必须是无凭据的 HTTP(S) 地址');
+    }
     this.token = options.token;
     this.timeoutMs = options.timeoutMs ?? 15000;
   }
 
-  /**
-   * 通用底层请求处理
-   */
+  // AutoDL 文档的 GET 需要 JSON body，不能使用原生 fetch 的 GET。
   private async request<T>(
     endpoint: string,
     method: 'GET' | 'POST',
-    body?: Record<string, unknown>
-  ): Promise<T> {
-    const url = `${this.baseUrl}${endpoint}`;
-    const controller = new AbortController();
-    const timeoutTimer = setTimeout(() => controller.abort(), this.timeoutMs);
+    body: Record<string, unknown>,
+    signal?: AbortSignal
+  ): Promise<AutoDLApiResponse<T>> {
+    if (signal?.aborted) {
+      throw new AutoDLNonRetryableError('AutoDL 请求在发送前已取消', { kind: 'cancelled' });
+    }
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const mutating = method === 'POST';
+    const data = JSON.stringify(body);
+    const url = new URL(`/api/v1/dev/instance/pro/${endpoint}`, this.baseUrl);
 
     try {
-      const headers: Record<string, string> = {
-        Authorization: this.token,
-        'Content-Type': 'application/json',
-      };
+      const response = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const transport = url.protocol === 'https:' ? https : http;
+        const req = transport.request(url, {
+          method,
+          signal: requestSignal,
+          headers: {
+            Authorization: this.token,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(data),
+            Accept: 'application/json',
+          },
+        }, (res) => {
+          const chunks: Buffer[] = [];
+          let size = 0;
+          res.on('data', (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > 1024 * 1024) {
+              const error = new AutoDLNonRetryableError('AutoDL 响应超过 1 MiB', {
+                kind: 'invalid_response', uncertain: mutating,
+              });
+              res.destroy(error);
+              req.destroy(error);
+              reject(error);
+              return;
+            }
+            chunks.push(chunk);
+          });
+          res.on('end', () => resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }));
+          res.on('error', reject);
+        });
+        req.on('error', reject);
+        req.end(data);
+      });
 
-      const requestInit: RequestInit = {
-        method,
-        headers,
-        signal: controller.signal,
-      };
-
-      if (body) {
-        requestInit.body = JSON.stringify(body);
-      }
-
-      logger.debug({ endpoint, method, body }, '发起 AutoDL API 请求');
-      const response = await fetch(url, requestInit);
-
-      // 处理 HTTP 层错误
-      if (response.status === 401 || response.status === 403) {
-        throw new AutoDLNonRetryableError(`AutoDL 开发者 Token 无效或未授权 (HTTP ${response.status})`, {
+      let json: unknown;
+      try { json = JSON.parse(response.body); } catch { /* HTTP 错误可能不是 JSON。 */ }
+      const parsed = envelopeSchema.safeParse(json);
+      if (response.status < 200 || response.status >= 300) {
+        const options = {
           statusCode: response.status,
+          code: parsed.success ? parsed.data.code : undefined,
+          requestId: parsed.success ? parsed.data.request_id : undefined,
+          uncertain: mutating && (response.status >= 500 || response.status === 408),
+        };
+        const message = parsed.success && parsed.data.msg
+          ? parsed.data.msg : `AutoDL HTTP ${response.status}`;
+        if (response.status === 429 || response.status === 408 || response.status >= 500) {
+          throw new AutoDLRetryableError(message, options);
+        }
+        throw new AutoDLNonRetryableError(message, options);
+      }
+      if (!parsed.success || !Object.prototype.hasOwnProperty.call(json, 'data')) {
+        throw new AutoDLNonRetryableError('AutoDL 响应不符合 API 信封格式', {
+          kind: 'invalid_response', uncertain: mutating,
         });
       }
-      if (response.status === 404) {
-        throw new AutoDLNonRetryableError(`请求的资源不存在 (HTTP 404)`, {
-          statusCode: response.status,
+      if (parsed.data.code !== 'Success') {
+        throw businessError(parsed.data.code, parsed.data.msg, parsed.data.request_id);
+      }
+      return parsed.data as AutoDLApiResponse<T>;
+    } catch (error) {
+      if (signal?.aborted) {
+        throw new AutoDLNonRetryableError('AutoDL 请求已取消；已送达的指令无法撤回', {
+          kind: 'cancelled', uncertain: mutating,
         });
       }
-      if (response.status >= 500) {
-        throw new AutoDLRetryableError(`AutoDL 服务端内部异常 (HTTP ${response.status})`, {
-          statusCode: response.status,
+      if (error instanceof AutoDLError) throw error;
+      if (timeout.aborted) {
+        throw new AutoDLRetryableError(`AutoDL 请求超时 (${this.timeoutMs}ms)`, {
+          uncertain: mutating,
         });
       }
-
-      let resData: AutoDLApiResponse<T>;
-      try {
-        resData = (await response.json()) as AutoDLApiResponse<T>;
-      } catch (err) {
-        throw new AutoDLRetryableError(`无法解析 AutoDL 响应为 JSON: ${String(err)}`);
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code && networkCodes.has(code)) {
+        throw new AutoDLRetryableError(`AutoDL 网络连接失败 (${code})`, {
+          uncertain: mutating,
+        });
       }
-
-      logger.debug({ endpoint, code: resData.code, msg: resData.msg }, '收到 AutoDL API 响应');
-
-      // 业务层判定：code 必须为 "Success"
-      if (resData.code !== 'Success') {
-        const errorMsg = resData.msg || `AutoDL API 返回错误代码: ${resData.code}`;
-        // 使用分类器自动判断是可重试还是不可重试
-        const { classifiedError } = classifyAutoDLError(new Error(errorMsg));
-        throw classifiedError;
-      }
-
-      return resData.data;
-    } catch (err: unknown) {
-      if (err instanceof AutoDLError) {
-        throw err;
-      }
-      if (err instanceof Error && err.name === 'AbortError') {
-        throw new AutoDLRetryableError(`AutoDL API 请求超时 (${this.timeoutMs}ms)`, { cause: err });
-      }
-      // 兜底错误分类
-      const { classifiedError } = classifyAutoDLError(err);
-      throw classifiedError;
-    } finally {
-      clearTimeout(timeoutTimer);
+      // 不传递底层请求对象，避免其 headers 将 token 带入日志或工具结果。
+      throw new AutoDLNonRetryableError('AutoDL 请求失败', { kind: 'unknown', uncertain: mutating });
     }
   }
 
-  /**
-   * 实例开机
-   * POST /api/v1/dev/instance/pro/power_on
-   */
-  async powerOn(instanceUuid: string, payload: 'gpu' = 'gpu', startCommand?: string): Promise<void> {
-    await this.request('/api/v1/dev/instance/pro/power_on', 'POST', {
-      instance_uuid: instanceUuid,
-      payload,
-      start_command: startCommand,
-    });
+  async powerOn(instanceUuid: string, signal?: AbortSignal): Promise<AutoDLApiResponse<null>> {
+    return this.request('power_on', 'POST', { instance_uuid: instanceUuid, payload: 'gpu' }, signal);
   }
 
-  /**
-   * 实例关机
-   * POST /api/v1/dev/instance/pro/power_off
-   */
-  async powerOff(instanceUuid: string): Promise<void> {
-    await this.request('/api/v1/dev/instance/pro/power_off', 'POST', {
-      instance_uuid: instanceUuid,
-    });
+  async powerOff(instanceUuid: string, signal?: AbortSignal): Promise<AutoDLApiResponse<null>> {
+    return this.request('power_off', 'POST', { instance_uuid: instanceUuid }, signal);
   }
 
-  /**
-   * 获取实例状态
-   * 官方文档标为 GET /api/v1/dev/instance/pro/status，请求体含 instance_uuid
-   */
-  async getStatus(instanceUuid: string): Promise<string> {
-    try {
-      const status = await this.request<string>(
-        '/api/v1/dev/instance/pro/status',
-        'POST',
-        { instance_uuid: instanceUuid }
-      );
-      return status;
-    } catch (err) {
-      // 降级使用 GET 尝试
-      try {
-        return await this.request<string>(
-          `/api/v1/dev/instance/pro/status?instance_uuid=${encodeURIComponent(instanceUuid)}`,
-          'GET'
-        );
-      } catch {
-        throw err;
-      }
+  async getStatus(instanceUuid: string, signal?: AbortSignal): Promise<string> {
+    const response = await this.request<unknown>('status', 'GET', { instance_uuid: instanceUuid }, signal);
+    if (typeof response.data !== 'string' || !response.data.trim()) {
+      throw new AutoDLNonRetryableError('AutoDL 状态不是非空字符串', {
+        kind: 'invalid_response', code: response.code, requestId: response.request_id,
+      });
     }
+    return response.data;
   }
 
-  /**
-   * 获取实例原始详情（包含敏感字段，供内部调用）
-   * /api/v1/dev/instance/pro/snapshot
-   */
-  async getRawSnapshot(instanceUuid: string): Promise<RawInstanceSnapshot> {
+  async getSafeSnapshot(instanceUuid: string, includeConnection = false, signal?: AbortSignal): Promise<SafeInstanceSnapshot> {
+    const status = await this.getStatus(instanceUuid, signal);
+    const safe: SafeInstanceSnapshot = { instance_uuid: instanceUuid, status };
+    if (!includeConnection) return safe;
     try {
-      return await this.request<RawInstanceSnapshot>(
-        '/api/v1/dev/instance/pro/snapshot',
-        'POST',
-        { instance_uuid: instanceUuid }
-      );
-    } catch (err) {
-      // 降级使用 GET 尝试
-      try {
-        return await this.request<RawInstanceSnapshot>(
-          `/api/v1/dev/instance/pro/snapshot?instance_uuid=${encodeURIComponent(instanceUuid)}`,
-          'GET'
-        );
-      } catch {
-        throw err;
+      const response = await this.request<unknown>('snapshot', 'GET', { instance_uuid: instanceUuid }, signal);
+      const connection = connectionSchema.safeParse(response.data);
+      if (!connection.success) {
+        safe.connection_warning = '实例详情暂未提供有效的 SSH host/port';
+      } else {
+        safe.ssh_host = connection.data.proxy_host;
+        safe.ssh_port = connection.data.ssh_port;
+        safe.ssh_user = 'root';
       }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      safe.connection_warning = '状态查询成功，但 SSH 连接详情暂不可用';
     }
-  }
-
-  /**
-   * 获取安全脱敏的实例详情（已剔除 root_password 和内部私密 token，面向 AI Agent）
-   */
-  async getSafeSnapshot(instanceUuid: string): Promise<SafeInstanceSnapshot> {
-    const raw = await this.getRawSnapshot(instanceUuid);
-    const status = await this.getStatus(instanceUuid).catch(() => 'unknown');
-
-    const safe: SafeInstanceSnapshot = {
-      instance_uuid: instanceUuid,
-      status,
-      region: raw.region_sign || 'unknown',
-      gpu_name: raw.snapshot_gpu_alias_name || 'unknown',
-      payg_price_per_hour_cny: (raw.payg_price ?? 0) / 1000,
-      ssh_host: raw.proxy_host,
-      ssh_port: raw.ssh_port,
-      ssh_user: 'root',
-      ssh_connect_command: `ssh -p ${raw.ssh_port} root@${raw.proxy_host}`,
-      jupyter_url: raw.jupyter_domain ? `https://${raw.jupyter_domain}` : undefined,
-      service_6006_url: raw.service_6006_domain
-        ? `${raw.service_6006_port_protocol || 'http'}://${raw.service_6006_domain}`
-        : undefined,
-      service_6008_url: raw.service_6008_domain
-        ? `${raw.service_6008_port_protocol || 'http'}://${raw.service_6008_domain}`
-        : undefined,
-      usage: raw.usage_info
-        ? {
-            cpu_usage_percent: raw.usage_info.cpu_usage_percent,
-            mem_usage_percent: raw.usage_info.mem_usage_percent,
-            root_fs_used_gb: raw.usage_info.root_fs_used_size
-              ? +(raw.usage_info.root_fs_used_size / (1024 * 1024 * 1024)).toFixed(2)
-              : undefined,
-            root_fs_total_gb: raw.usage_info.root_fs_total_size
-              ? +(raw.usage_info.root_fs_total_size / (1024 * 1024 * 1024)).toFixed(2)
-              : undefined,
-          }
-        : undefined,
-    };
-
     return safe;
-  }
-
-  /**
-   * 获取实例列表
-   * POST /api/v1/dev/instance/pro/list
-   */
-  async listInstances(pageIndex = 1, pageSize = 20): Promise<InstanceListResult> {
-    return await this.request<InstanceListResult>(
-      '/api/v1/dev/instance/pro/list',
-      'POST',
-      {
-        page_index: pageIndex,
-        page_size: pageSize,
-      }
-    );
-  }
-
-  /**
-   * 查询账户余额
-   * POST /api/v1/dev/wallet/balance
-   */
-  async getBalance(): Promise<WalletBalance> {
-    const data = await this.request<{ assets: number; accumulate: number; voucher_balance: number }>(
-      '/api/v1/dev/wallet/balance',
-      'POST'
-    );
-    return {
-      assets: data.assets,
-      assets_cny: +(data.assets / 1000).toFixed(2),
-      accumulate: data.accumulate,
-      voucher_balance: data.voucher_balance,
-      voucher_balance_cny: +(data.voucher_balance / 1000).toFixed(2),
-    };
   }
 }

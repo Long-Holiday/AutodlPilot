@@ -1,52 +1,44 @@
-/**
- * 实例级别互斥控制器，维护运行中任务的 AbortController 与定时器引用
- */
+import { randomUUID } from 'node:crypto';
+
+export interface InstanceLease {
+  id: string;
+  controller: AbortController;
+  released: Promise<void>;
+  resolveRelease: () => void;
+}
+
 export class InstanceMutex {
-  private activeControllers = new Map<string, AbortController>();
+  private readonly leases = new Map<string, InstanceLease>();
 
-  /**
-   * 尝试获取实例锁并绑定 AbortController
-   */
-  acquire(instanceUuid: string): AbortController {
-    if (this.activeControllers.has(instanceUuid)) {
-      throw new Error(`实例 ${instanceUuid} 当前已有活跃的开机任务正在执行`);
-    }
-    const controller = new AbortController();
-    this.activeControllers.set(instanceUuid, controller);
-    return controller;
+  acquire(instanceUuid: string): InstanceLease | undefined {
+    if (this.leases.has(instanceUuid)) return undefined;
+    let resolveRelease!: () => void;
+    const released = new Promise<void>((resolve) => { resolveRelease = resolve; });
+    const lease = { id: randomUUID(), controller: new AbortController(), released, resolveRelease };
+    this.leases.set(instanceUuid, lease);
+    return lease;
   }
 
-  /**
-   * 检查实例是否被占用
-   */
-  isLocked(instanceUuid: string): boolean {
-    return this.activeControllers.has(instanceUuid);
+  getLease(instanceUuid: string): InstanceLease | undefined {
+    return this.leases.get(instanceUuid);
   }
 
-  /**
-   * 获取指定实例的当前 AbortController
-   */
-  getController(instanceUuid: string): AbortController | undefined {
-    return this.activeControllers.get(instanceUuid);
+  release(instanceUuid: string, lease: InstanceLease): boolean {
+    if (this.leases.get(instanceUuid) !== lease) return false;
+    this.leases.delete(instanceUuid);
+    lease.resolveRelease();
+    return true;
   }
 
-  /**
-   * 释放实例锁
-   */
-  release(instanceUuid: string): void {
-    this.activeControllers.delete(instanceUuid);
+  abort(instanceUuid: string, reason: string): boolean {
+    const lease = this.leases.get(instanceUuid);
+    if (!lease) return false;
+    // 取消仅发信号。必须等待 owner 清理完成后才能释放锁。
+    lease.controller.abort(new Error(reason));
+    return true;
   }
 
-  /**
-   * 取消指定实例正在执行的任务并释放锁
-   */
-  abort(instanceUuid: string, reason = '任务被中断'): boolean {
-    const controller = this.activeControllers.get(instanceUuid);
-    if (controller) {
-      controller.abort(new Error(reason));
-      this.activeControllers.delete(instanceUuid);
-      return true;
-    }
-    return false;
+  abortAll(reason: string): void {
+    for (const lease of this.leases.values()) lease.controller.abort(new Error(reason));
   }
 }

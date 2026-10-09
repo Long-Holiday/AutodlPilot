@@ -1,7 +1,8 @@
 {
   "mcpServers": {
     "autodl-pilot": {
-      "url": "http://your-remote-server-ip:3000/mcp",
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
       "headers": {
         "Authorization": "Bearer your_secure_mcp_access_token_here"
       }

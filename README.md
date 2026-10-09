@@ -1,345 +1,174 @@
-# AutoDL Pilot MCP: 基于 Model Context Protocol 的 AutoDL GPU 实例自动化管理服务
+# AutoDL Pilot MCP
 
-[![Node.js](https://img.shields.io/badge/Node.js-v20%2B-green.svg)](https://nodejs.org/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)](https://www.typescriptlang.org/)
-[![MCP](https://img.shields.io/badge/Protocol-MCP%20Streamable%20HTTP-orange.svg)](https://modelcontextprotocol.io/)
-[![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
+基于 TypeScript 的远程 MCP 服务，只包装 [AutoDL 容器实例 Pro API](https://www.autodl.com/docs/instance_pro_api/) 的实例生命周期。Agent 在本机运行，通过 prompt 提供 `pro-...` 实例 ID；MCP 不创建实例，也不选择 GPU。
 
-AutoDL Pilot 是一个专为本地 AI Agent 设计的 **AutoDL GPU 实例自动化生命周期管理服务**。遵循官方 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 规范，采用 **Streamable HTTP** 传输协议，参考 [AutoDL 容器实例Pro官方 API 文档](https://www.autodl.com/docs/instance_pro_api/)，实现 GPU 实例首次开机、智能退避持续开机、关机竞态消除、安全 SSH 鉴权信息脱敏与远程实验任务跟踪。
+## 职责边界
 
----
+| 位置 | 负责什么 |
+| --- | --- |
+| 远程 MCP 服务器 | 从部署项目根 `.env` 读取开发者 token；单次开机、显式持续请求、状态查询、关机；持久化重试任务。 |
+| 本机 Agent | 修改代码、经授权 commit/push、持有 SSH 私钥、SSH 拉取最新代码、执行实验命令、查看日志/进程。 |
+| AutoDL 实例 | 接收开关机指令；开机后通过 SSH 执行本机发起的操作。 |
 
-## 目录
-
-- [系统架构与安全边界](#系统架构与安全边界)
-- [核心特性](#核心特性)
-- [项目目录结构](#项目目录结构)
-- [快速开始](#快速开始)
-- [MCP Tools 工具接口定义](#mcp-tools-工具接口定义)
-- [AI Agent 本地 SSH 与 Git 工作流](#ai-agent-本地-ssh-与-git-工作流)
-- [远程服务器生产部署方案](#远程服务器生产部署方案)
-- [测试套件说明](#测试套件说明)
-
----
-
-## 系统架构与安全边界
-
-### 1. 架构总览
-
-```mermaid
-flowchart TD
-    subgraph Local["本地开发机 (Local Environment)"]
-        Agent["🤖 本地 AI Agent"]
-        GitLocal["📦 本地 Git 仓库\n(代码编写/Commit/Push)"]
-        SSHKey["🔑 本地 Ed25519 私钥\n(~/.ssh/id_ed25519_autodl)"]
-        SSHClient["💻 本地 SSH Client\n(wait-for-ssh / git-sync-run)"]
-    end
-
-    subgraph RemoteServer["远程部署服务器 (Remote Server)"]
-        subgraph MCPServer["AutoDL Pilot MCP 服务 (:3000)"]
-            AuthMiddle["🛡️ Bearer Token 鉴权中间件"]
-            Transport["⚡ Streamable HTTP Transport (/mcp)"]
-            Tools["🧰 MCP Tools 处理器"]
-            Scheduler["🔄 持续开机调度器 & 互斥锁"]
-            ExpMgr["🧪 实验元数据管理器"]
-            SQLite[("💾 SQLite 持久化\n(WAL 模式)")]
-            Client["🌐 AutoDL 官方 API Client"]
-        end
-    end
-
-    subgraph AutoDLPlatform["AutoDL 云平台"]
-        OfficialAPI["☁️ AutoDL 官方 API\n(api.autodl.com)"]
-        GPUInstance["🖥️ GPU 容器实例 (SSH/Jupyter)"]
-    end
-
-    Agent -->|1. HTTP /mcp 携带 MCP_AUTH_TOKEN| AuthMiddle
-    AuthMiddle --> Transport --> Tools
-    Tools --> Scheduler & ExpMgr
-    Scheduler -->|记录任务状态| SQLite
-    ExpMgr -->|记录实验信息| SQLite
-    Scheduler --> Client
-    Tools --> Client
-    Client -->|2. 调用官方 API| OfficialAPI
-
-    Agent -->|3. 获取已脱敏 SSH 信息| Tools
-    Agent -->|4. 本地执行免密登录与代码同步| SSHClient
-    SSHClient -->|5. 使用本地私钥免密登录| GPUInstance
-    GitLocal -->|Push 代码| GPUInstance
-```
-
-### 2. 安全与职责边界
-
-| 功能维度 | 远程 MCP Server 职责 | 本地 AI Agent 职责 |
-| :--- | :--- | :--- |
-| **凭证管理** | 从 `.env` 读取 AutoDL 开发者 Token；使用独立的 `MCP_AUTH_TOKEN` 拦截未授权访问。 | 持有本地 SSH 私钥；持有 Git 提交与 Push 权限。 |
-| **敏感信息保护** | **自动剥离 AutoDL 返回的 `root_password`**，仅输出主机、端口、用户名等安全字段。 | SSH 私钥永不上传远端；私有仓库使用只读 Token 或 Deploy Key。 |
-| **生命周期调度** | 负责实例开机、GPU 资源不足后台持续重试、关机操作及竞态消除。 | 发起开机/关机指令，查询实例状态与任务进度。 |
-| **实验与代码执行** | 提供标准化的后台命令模板（防 SSH 中断）与实验元数据持久化。 | **实际 SSH 连接、代码拉取、依赖安装和训练运行全部由本地 Agent 执行**。 |
-
----
-
-## 核心特性
-
-1. **协议现代化（Streamable HTTP）**：
-   - 采用官方 `@modelcontextprotocol/sdk` 的 `StreamableHTTPServerTransport`，支持 Direct HTTP 与 SSE 双向流式响应。
-   - 独立的 HTTP Bearer Token 保护，防止远程暴露未授权接口。
-2. **智能持续开机与退避算法（Smart Retry Engine）**：
-   - **即时响应**：首次开机立即向 Agent 返回结果。
-   - **自动降级重试**：因 GPU 资源紧张开机失败时，自动创建后台重试任务，不阻塞 MCP 连接。
-   - **指数退避与 Jitter**：配置初始间隔、退避倍数、最大间隔及 ±10% 随机扰动，保护 AutoDL 平台接口。
-   - **错误精准分类**：鉴权失败、实例不存在、账户欠费等不可重试错误立即终止并告警；资源不足和网络抖动自动重试。
-3. **SQLite 状态持久化与重启恢复（Crash-Proof）**：
-   - 所有开机任务与实验记录持久化到 SQLite（启用 WAL 模式）。
-   - 服务崩溃或重启后自动扫描未完成任务，比对远端真实状态无缝恢复重试循环。
-4. **关机竞态消除（Race Condition Prevention）**：
-   - 实例级互斥锁保证同一实例不发生并发开机冲突。
-   - Agent 发起关机操作时，**强制同步取消该实例所有后台重试任务并打断执行**，彻底避免关机后又被后台任务唤醒扣费。
-5. **完整运行就绪检测**：
-   - 开机 API 成功并不代表系统完全就绪，调度器持续轮询直到实例进入 `running`。
-   - 提供本地 SSH 端口探针脚本，等待 sshd 服务与公钥加载完毕后再执行实验。
-
----
-
-## 项目目录结构
-
-```text
-AutodlPilot/
-├── package.json                   # 项目依赖与编译配置
-├── tsconfig.json                  # TypeScript 严格模式配置
-├── .env.example                   # 环境变量模板
-├── src/
-│   ├── index.ts                   # 主入口：初始化 Express、MCP Transport 与优雅退出
-│   ├── config/                    # 基于 Zod 的类型安全配置管理
-│   │   └── index.ts
-│   ├── logger/                    # Pino 高性能结构化日志
-│   │   └── index.ts
-│   ├── autodl/                    # AutoDL 官方 API Client 与错误分类
-│   │   ├── client.ts              # 封装官方 REST API（带重试与脱敏）
-│   │   ├── errors.ts              # 错误分类器（Retryable vs NonRetryable）
-│   │   └── types.ts               # 数据模型定义
-│   ├── storage/                   # SQLite 持久化层
-│   │   ├── db.ts                  # SQLite 实例与 WAL 模式初始化
-│   │   ├── task-store.ts          # 持续开机任务仓储
-│   │   └── experiment-store.ts    # 实验元数据仓储
-│   ├── scheduler/                 # 持续开机调度器
-│   │   ├── mutex.ts               # 实例级互斥锁与 AbortController 管理
-│   │   └── scheduler.ts           # 状态机流转、退避算法与任务恢复
-│   ├── experiment/                # 实验管理器
-│   │   └── manager.ts             # 实验注册、nohup 模板与自动关机
-│   ├── mcp/                       # Model Context Protocol 服务实现
-│   │   ├── middleware.ts          # MCP Bearer Token 鉴权中间件
-│   │   └── server.ts              # 11 个 MCP Tools 注册与调用处理
-│   └── client-workflow/           # 本地 Agent 执行的辅助工作流脚本
-│       ├── ssh-init.sh            # 本地 Ed25519 密钥生成与 SSH Config 配置
-│       ├── wait-for-ssh.sh        # SSH 端口与免密登录就绪探针
-│       ├── git-sync-run.sh        # 本地提交校验、远端代码检出与后台运行
-│       └── README.md              # 本地 Agent 操作指南
-├── tests/                         # 自动化测试套件 (Vitest)
-│   ├── autodl-client.test.ts      # 错误分类与敏感信息过滤测试
-│   ├── scheduler.test.ts          # 状态机流转与持续开机重试测试
-│   ├── race-condition.test.ts     # 关机竞态与互斥冲突测试
-│   ├── recovery.test.ts           # 服务重启持久化任务恢复测试
-│   └── mcp-integration.test.ts    # MCP 鉴权与工具集成测试
-└── scripts/                       # 生产部署脚本
-    ├── setup-remote.sh            # 远程服务器一键部署脚本
-    ├── autodl-mcp.service         # systemd 服务管理配置
-    └── mcp-client-config.json     # MCP Client 连接配置示例
-```
-
----
+远程 MCP **不执行 SSH/bash，不存储 Git 凭据或实验命令，不管理实验结果，不根据实验完成自动关机**。本机 SSH 免密登录需要先配置，详见 [本机流程](scripts/local/README.md)。
 
 ## 快速开始
 
-### 1. 安装环境与依赖
-
-运行环境要求：Node.js >= 20.x，npm >= 9.x。
+推荐 **Node 24 LTS**，最低 Node 24。使用已提交的 lockfile 安装：
 
 ```bash
-git clone <your-repo-url> AutodlPilot
-cd AutodlPilot
-npm install
-```
-
-### 2. 配置环境变量
-
-复制 `.env.example` 并生成 `.env`：
-
-```bash
-cp .env.example .env
-```
-
-编辑 `.env` 文件，填入配置：
-
-```ini
-# [必填] AutoDL 开发者 Token (从 AutoDL 控制台 -> 设置 -> 开发者Token 获取)
-AUTODL_TOKEN=your_autodl_developer_token_here
-
-# [必填] 保护远程 MCP 服务的访问 Token (客户端调用时携带)
-MCP_AUTH_TOKEN=your_secure_mcp_access_token_here
-
-# [可选] 服务监听端口与地址
-PORT=3000
-HOST=0.0.0.0
-
-# [可选] SQLite 数据库持久化路径
-DATABASE_PATH=./data/autodl-pilot.db
-
-# [可选] 重试调度参数
-RETRY_INITIAL_INTERVAL_SEC=10
-RETRY_MAX_INTERVAL_SEC=120
-RETRY_BACKOFF_FACTOR=1.5
-RETRY_MAX_DURATION_MINUTES=120
-```
-
-### 3. 构建与本地运行
-
-```bash
-# 编译 TypeScript
+npm ci
+# 已有 .env 时不覆盖
+[ -f .env ] || cp .env.example .env
+# 编辑 .env，填入 AUTODL_TOKEN 和不同的 MCP_AUTH_TOKEN
 npm run build
-
-# 运行全套测试
 npm test
-
-# 启动服务
 npm start
 ```
 
----
+`npm start` 是真实服务启动，会恢复尚未过期、由新版本显式创建的持续任务，可能产生开机与计费操作。未准备好时只运行 build/test；测试不会读取真实 `.env` 或控制真实实例。
 
-## MCP Tools 工具接口定义
+配置文件始终从项目根读取，不依赖启动 cwd；`DATABASE_PATH` 的相对路径也从项目根解析。进程已显式设置的环境变量优先于 `.env`。`.env` 不应提交到 Git；远程服务器上建议权限为 `0640` 或更严格。
 
-服务向 AI Agent 暴露以下 11 个标准化 MCP 工具：
+### 必要配置
 
-| 工具名称 | 功能描述 | 核心输入参数 |
-| :--- | :--- | :--- |
-| `power_on_instance` | 请求开启实例。若 GPU 不足自动转入后台持久化重试。 | `instance_uuid`, `start_command?` |
-| `power_off_instance` | 关闭实例。**自动强制取消所有挂起的开机重试，杜绝竞态**。 | `instance_uuid` |
-| `get_instance_info` | 查询实例状态、GPU型号、已脱敏安全 SSH 信息（已过滤密码）。 | `instance_uuid` |
-| `get_power_on_task_status` | 查询持续开机任务状态、重试次数、最近错误及下次重试时间。 | `task_id?`, `instance_uuid?` |
-| `cancel_power_on_task` | 主动取消后台正在执行的开机重试任务。 | `task_id`, `reason?` |
-| `list_instances` | 分页查看当前账户下所有的 AutoDL 实例。 | `page_index?`, `page_size?` |
-| `get_account_balance` | 查询当前账户现金余额、累计消费及代金券可用余额。 | 无 |
-| `register_experiment` | 注册实验元数据，生成防 SSH 断开的后台命令包装器。 | `instance_uuid`, `command`, `git_commit_sha?`, `auto_power_off?` |
-| `update_experiment_status` | 记录实验运行 PID、退出码及完成状态。支持结束后自动关机。 | `exp_id`, `status`, `pid?`, `exit_code?` |
-| `get_experiment_status` | 查询实验详情、日志路径、开始/结束时间与退出码。 | `exp_id?`, `instance_uuid?` |
-| `get_ssh_setup_guide` | 获取本地 Ed25519 密钥生成、AutoDL 公钥配置与 SSH Config 指南。 | `instance_uuid?` |
-
----
-
-## AI Agent 本地 SSH 与 Git 工作流
-
-本地 AI Agent 按照以下标准序列控制实验环境：
-
-### 步骤 1：本地执行免密登录初始化（一次性）
-
-在本地执行：
-```bash
-bash src/client-workflow/ssh-init.sh
-```
-将打印出的 `~/.ssh/id_ed25519_autodl.pub` 添加到 AutoDL 控制台的「SSH公钥」中。
-
-### 步骤 2：开机与状态获取
-
-Agent 通过 MCP 调用：
-1. `power_on_instance({ instance_uuid: "pro-xxxx" })`
-2. 若转入后台重试，Agent 可定期调用 `get_power_on_task_status({ instance_uuid: "pro-xxxx" })` 查看进度。
-3. 当状态变为 `running` 时，调用 `get_instance_info` 获取脱敏连接信息：
-   - 返回示例：`{ ssh_host: "connect.westb.autodl.com", ssh_port: 34222, ssh_user: "root" }`
-
-### 步骤 3：SSH 就绪探针
-
-Agent 在本地运行探测脚本，确认远端 SSH 服务与公钥完全就绪：
-```bash
-bash src/client-workflow/wait-for-ssh.sh connect.westb.autodl.com 34222
+```dotenv
+# AutoDL 控制台账号设置中的开发者 token
+AUTODL_TOKEN=your_autodl_developer_token_here
+# 独立 MCP 凭据；不要复用 AUTODL_TOKEN
+MCP_AUTH_TOKEN=your_secure_mcp_access_token_here
+HOST=127.0.0.1
+PORT=3000
+DATABASE_PATH=./data/autodl-pilot.db
 ```
 
-### 步骤 4：本地 Git 提交与远程代码检出
+其他选项见 [`.env.example`](.env.example)。默认持续任务最多 **120 分钟**，起始间隔 **10 秒**，最大间隔 **120 秒**，退避因子 **1.5**，附带抖动。该上限从任务创建时计算，重启不会重置；配置可调整，最长支持 24 小时。开机接受/结果不确定后的状态观察窗口默认 180 秒，观察超时不会再次盲目开机。
 
-1. 本地代码完成修改后，执行 `git commit` 和 `git push`。
-2. Agent 执行代码同步脚本：
-   ```bash
-   bash src/client-workflow/git-sync-run.sh \
-     connect.westb.autodl.com \
-     34222 \
-     https://github.com/my-org/my-project.git \
-     /root/autodl-tmp/workspace \
-     "python train.py --epochs 20"
-   ```
-   脚本将比对本地与远端的 Commit SHA，确保远程执行代码与本地提交版本绝对一致。
+## 六个 MCP 工具
 
-### 步骤 5：登记实验与后台无中断运行
+所有工具运行时校验参数；实例 ID 必须以 `pro-` 开头。除了表内参数，不接受 `start_command`、Git token 或实验命令。
 
-1. Agent 调用 `register_experiment` 注册实验并获取包装命令：
+| 工具 | 参数 | 行为 |
+| --- | --- | --- |
+| `power_on_instance` | `instance_uuid` | 只调用一次开机 API，返回接受或真实失败；不自动创建任务，不等待 running。 |
+| `retry_power_on_instance` | `instance_uuid` | 显式启动后台持续请求，快速返回任务 ID 和截止时间；同实例重复请求返回现有任务。 |
+| `get_instance_info` | `instance_uuid`, `include_connection?` | 返回原始状态。默认仅查状态；`include_connection=true` 时附安全 SSH host/port/user。 |
+| `power_off_instance` | `instance_uuid` | 取消关联持续任务，等待在途开机清理，再提交关机；接受不代表已经停止。 |
+| `get_power_on_task_status` | `task_id` **或** `instance_uuid` | 只查本地任务存储。按实例查询最近任务，包含终态；两个参数不能同时提供。 |
+| `cancel_power_on_task` | `task_id` | 取消持续请求；不关闭已开机实例。 |
+
+### 典型调用
+
+1. 本机 Agent 根据用户 prompt 获取实例 ID，并调用：
+
    ```json
-   {
-     "instance_uuid": "pro-xxxx",
-     "command": "python train.py --epochs 20",
-     "git_commit_sha": "c1f7a39...",
-     "auto_power_off": true
-   }
+   { "name": "power_on_instance", "arguments": { "instance_uuid": "pro-759127a8714f" } }
    ```
-2. Agent 通过 SSH 在远端后台拉起实验（使用 `setsid`/`nohup` 自动重定向日志，并记录 PID）。
-3. 训练完成后，若启用了 `auto_power_off`，系统自动关闭机器以节省成本。
 
----
+2. 返回 `status: "accepted"` 时由 Agent 查询真实状态；不要再调用持续工具。若返回 `status: "gpu_unavailable"`、`retryable: true`，由 Agent 显式调用：
 
-## 远程服务器生产部署方案
+   ```json
+   { "name": "retry_power_on_instance", "arguments": { "instance_uuid": "pro-759127a8714f" } }
+   ```
 
-### 方式 1：使用自动化脚本一键部署
+   API/网络超时会带 `outcome_uncertain: true`：先查询状态，不能把它当作 GPU 不足直接重复开机。业务错误保留原始 `code`、`message`、`request_id`。
 
-在远程 Linux 服务器（Ubuntu / Debian）上执行：
+3. 根据返回的 `task.task_id` 查询进度，或按实例查询：
 
-```bash
-sudo bash scripts/setup-remote.sh
-```
+   ```json
+   { "name": "get_power_on_task_status", "arguments": { "instance_uuid": "pro-759127a8714f" } }
+   ```
 
-脚本将自动完成：
-- 安装 Node.js 22 LTS 运行环境；
-- 同步代码到 `/opt/autodl-pilot`；
-- 安装依赖并完成 TypeScript 编译；
-- 配置并启动 `systemd` 服务守护进程（支持奔溃自愈与开机自启）。
+   任务状态为 `PENDING / RUNNING / RETRYING / SUCCESS / FAILED / CANCELLED / TIMEOUT`；这些是本项目任务状态，**不是官方实例状态枚举**。`RUNNING` 表示 worker 正在工作，不代表 GPU 实例已运行。`retry_count` 计数每次实际 `power_on` 尝试，包括第一次后台尝试；返回 `next_retry_at`、`deadline_at`、最后错误和停止原因，时间均为 Unix 毫秒。
 
-### 方式 2：手动 systemd 服务配置
+4. 确认实例 `running` 后查询连接信息：
 
-将 `scripts/autodl-mcp.service` 安装到系统：
+   ```json
+   { "name": "get_instance_info", "arguments": { "instance_uuid": "pro-759127a8714f", "include_connection": true } }
+   ```
 
-```bash
-sudo cp scripts/autodl-mcp.service /etc/systemd/system/autodl-mcp.service
-sudo systemctl daemon-reload
-sudo systemctl enable autodl-mcp
-sudo systemctl start autodl-mcp
-```
+   仅投影 `ssh_host / ssh_port / ssh_user`；不返回 `root_password`、Jupyter token 或平台提供的任意 SSH 命令。详情查询失败时仍保留成功取得的状态，并返回 `connection_warning`。
 
-### MCP 客户端配置示例（Claude Desktop / Cursor）
+5. 本机检查免密 SSH，修改代码并经授权 commit/push，执行拉取和实验命令；无需向 MCP 登记实验。结束后根据用户意图调用 `power_off_instance`，再查询实际状态。
 
-在客户端的 MCP 配置文件中添加：
+### 持续任务语义与边界
+
+- 同实例初次开机、worker 和关机由实例级所有权锁协调；取消不提前释放锁，迟到响应不能覆盖任务终态。
+- 只有已知停止态才发起后台开机。兼容约定为 `stopped / shutdown`；官方文档只给出了 `running` 示例，未公布完整状态表。其他状态原样返回、继续查询，**不猜测为已停止**。
+- GPU 不足使用保守文案兼容规则，不杜撰官方错误码。HTTP 429、5xx 和状态查询网络故障按退避处理；未知业务错误、鉴权/参数错误停止任务。
+- API 接受开机后只观察状态。发送前记录 `VERIFY` 阶段，避免崩溃恢复时盲目重发。成功进入 `running` 才将持续任务标记 `SUCCESS`。
+- 取消、超时和失败只停止持续任务，不自动关机。客户端断开不取消任务；服务重启按原截止时间恢复显式持续任务。
+- 网络取消无法撤回 AutoDL 已收到的请求。关机顺序避免本服务旧 worker 再发开机，但不能承诺平台侧绝无迟到请求；请查询实际状态，必要时再次显式关机。
+- 以 **单服务进程/单实例部署** 使用 SQLite 和进程内锁，不运行多个进程共同调度同一数据库。
+
+## 官方 API 对齐
+
+服务使用 Node 原生 HTTP(S) 请求，支持文档明确写出的 **GET + JSON body**，无 POST/GET-query 猜测式 fallback：
+
+| 操作 | 方法/路径 | JSON body |
+| --- | --- | --- |
+| 开机 | `POST /api/v1/dev/instance/pro/power_on` | `{ "instance_uuid": "pro-...", "payload": "gpu" }` |
+| 关机 | `POST /api/v1/dev/instance/pro/power_off` | `{ "instance_uuid": "pro-..." }` |
+| 状态 | `GET /api/v1/dev/instance/pro/status` | `{ "instance_uuid": "pro-..." }` |
+| 可选连接详情 | `GET /api/v1/dev/instance/pro/snapshot` | `{ "instance_uuid": "pro-..." }` |
+
+AutoDL 的认证是 `Authorization: <AUTODL_TOKEN>`，**不加 Bearer**；本机访问 MCP 才使用 `Authorization: Bearer <MCP_AUTH_TOKEN>`。不支持 API 无卡开机，也不发送 `start_command`。官方认证要求、状态和错误契约以 [文档](https://www.autodl.com/docs/instance_pro_api/) 为准。
+
+## 远程部署与连接
+
+MCP 为无状态 **Streamable HTTP**：每个 POST 创建独立 server/transport，调度器共享；不依赖会话 ID，GET/DELETE 返回 405。无需 SSE 常驻连接。
+
+- 默认监听 `127.0.0.1:3000`，用 HTTPS 反向代理暴露 `/mcp`，或使用受信任 SSH/私有网络隧道。不要将携带 token 的明文 HTTP 直接暴露公网。
+- 仅接受 Authorization 头，不接受 URL query token。
+- 带 `Origin` 的请求必须精确匹配 `MCP_ALLOWED_ORIGINS`；默认空列表拒绝浏览器请求。不带 Origin 的正常 MCP Agent 请求可通过认证。
+- `/health` 是无鉴权服务存活检查，不测试 AutoDL、不包含账户信息。
+
+支持远程 HTTP 的客户端可参考 [`scripts/mcp-client-config.json`](scripts/mcp-client-config.json)：
 
 ```json
 {
   "mcpServers": {
     "autodl-pilot": {
-      "url": "http://your-remote-server-ip:3000/mcp",
-      "headers": {
-        "Authorization": "Bearer your_secure_mcp_access_token_here"
-      }
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer your_secure_mcp_access_token_here" }
     }
   }
 }
 ```
 
----
+只替换 MCP 访问 token，不把 AutoDL 开发者 token 放在客户端。具体配置字段以所用客户端支持的 HTTP 配置为准。
 
-## 测试套件说明
+### systemd（Linux）
 
-项目包含了完整的自动化测试套件，全面覆盖核心场景：
+在远程服务器上准备系统级 `/usr/bin/node`（推荐 Node 24 LTS）、npm、编译工具及 systemd 后：
 
 ```bash
-npm test
+sudo bash scripts/setup-remote.sh
+# 检查 /opt/autodl-pilot/.env；已有文件不覆盖
+sudo systemctl enable --now autodl-mcp
+sudo journalctl -u autodl-mcp -f
 ```
 
-测试覆盖场景包括：
-- `tests/autodl-client.test.ts`: 错误分类（区分可重试/不可重试错误）、密码及敏感信息严格脱敏；
-- `tests/scheduler.test.ts`: 状态机流转、首次开机成功、GPU 资源不足自动转入退避重试、主动取消任务；
-- `tests/race-condition.test.ts`: **关机竞态测试**（关机强制打断重试循环并清除活跃任务）、多任务并发幂等互斥；
-- `tests/recovery.test.ts`: **服务重启恢复测试**（从 SQLite 重建未完成任务并与远端状态同步）；
-- `tests/mcp-integration.test.ts`: MCP 访问 Token 认证中间件拦截与放行、MCP Tools 注册与调用。
+脚本默认只准备部署，不启用服务；源项目 `.env` 在目标尚无配置时才复制，否则复制模板。数据目录归服务用户 `autodl-pilot` 所有，构建以非 root 用户在独立 staging 目录执行，不包含数据库或密钥。旧产物保留在输出的 staging 路径，确认后自行清理。
+
+已在运行的服务只能显式使用 `sudo bash scripts/setup-remote.sh --start` 停止、更新和重启。模板仅允许写入默认 `data/`；若自定义数据库目录，同时调整 `ReadWritePaths` 和目录权限。`HOST` 若在已有 `.env` 中配置为 `0.0.0.0`，不会自动改写；部署前请检查监听和防火墙。
+
+## 从 1.x 升级
+
+2.x 是有意收敛的接口变更：删除余额、实例枚举、实验三工具与 SSH 指引工具，删除 `start_command` 和取消原因参数；首次失败不再自动重试。客户端应显式使用 `retry_power_on_instance`。
+
+数据库采用增量迁移，不删除历史实验表、记录或旧命令列，也不将其返回 MCP。旧版本自动创建的活动任务标记停止并要求显式重新发起，避免升级时意外恢复计费操作。新版本显式任务可在服务重启后继续恢复。
+
+## 开发与验证
+
+```bash
+npm run build
+npm run typecheck
+npm test
+npm run check:shell
+```
+
+测试使用假凭据、本地假 AutoDL HTTP 服务、SDK MCP 客户端、虚拟时间和替身 SSH/Git，覆盖 API 方法/请求体/脱敏、单次与显式持续请求、并发取消/关机、截止时间/恢复、MCP 重连/鉴权/校验、本机脚本执行与错误退出。不代表已完成真实 AutoDL 开关机、SSH 登录或服务器部署验证。
+
+源码分为 `src/autodl`、`src/scheduler`、`src/storage`、`src/mcp`；本机辅助脚本独立放在 `scripts/local`，不属于 MCP 运行时。

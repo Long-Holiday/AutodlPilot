@@ -1,121 +1,143 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import Database from 'better-sqlite3';
-import { TaskStore } from '../src/storage/task-store.js';
-import { PowerOnScheduler } from '../src/scheduler/scheduler.js';
-import { AutoDLClient } from '../src/autodl/client.js';
-import { AutoDLRetryableError, AutoDLNonRetryableError } from '../src/autodl/errors.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AutoDLRetryableError, AutoDLNonRetryableError, businessError } from '../src/autodl/errors.js';
+import { createHarness, deferred, flushWork, success } from './helpers.js';
 
-function createInMemoryTaskStore(): TaskStore {
-  const db = new Database(':memory:');
-  db.exec(`
-    CREATE TABLE power_on_tasks (
-      task_id TEXT PRIMARY KEY,
-      instance_uuid TEXT NOT NULL,
-      status TEXT NOT NULL,
-      payload TEXT NOT NULL DEFAULT 'gpu',
-      start_command TEXT,
-      retry_count INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      next_retry_at INTEGER,
-      last_error TEXT,
-      stop_reason TEXT
-    );
-  `);
-  return new TaskStore(db);
-}
-
-describe('PowerOnScheduler 状态机与重试调度测试', () => {
-  let taskStore: TaskStore;
-  let mockClient: AutoDLClient;
-  let scheduler: PowerOnScheduler;
-
+describe('单次开机与显式持续请求', () => {
+  let harness: ReturnType<typeof createHarness>;
   beforeEach(() => {
-    taskStore = createInMemoryTaskStore();
-    mockClient = new AutoDLClient({
-      baseUrl: 'https://api.autodl.com',
-      token: 'fake_token',
-    });
-    scheduler = new PowerOnScheduler(mockClient, taskStore, {
-      initialIntervalSec: 1,
-      maxIntervalSec: 5,
-      backoffFactor: 2,
-      maxDurationMinutes: 10,
-      pollStatusIntervalSec: 1,
-      pollStatusTimeoutSec: 5,
-    });
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    harness = createHarness();
+  });
+  afterEach(async () => { await harness.close(); vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  it('单次成功只发一个开机请求，不查询状态、不创建后台任务', async () => {
+    const result = await harness.scheduler.requestPowerOn('pro-once');
+    expect(result).toMatchObject({ status: 'accepted', request_id: 'request-test' });
+    expect(harness.client.powerOn).toHaveBeenCalledOnce();
+    expect(harness.client.getStatus).not.toHaveBeenCalled();
+    expect(harness.store.getLatestTaskByInstance('pro-once')).toBeNull();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(harness.client.powerOn).toHaveBeenCalledOnce();
   });
 
-  it('场景 1: 首次开机立即成功，正确返回即时结果并完成状态流转', async () => {
-    vi.spyOn(mockClient, 'getStatus')
-      .mockResolvedValueOnce('stopped') // 初始状态
-      .mockResolvedValueOnce('running'); // 开机后轮询就绪
-    vi.spyOn(mockClient, 'powerOn').mockResolvedValue(undefined);
-
-    const result = await scheduler.requestPowerOn('pro-test-success');
-
-    expect(result.isImmediateSuccess).toBe(true);
-    expect(result.task.status).toBe('RUNNING');
-
-    // 等待后台轮询进入 running
-    await new Promise((r) => setTimeout(r, 200));
-
-    const updatedTask = taskStore.getTaskById(result.task.task_id);
-    expect(updatedTask?.status).toBe('SUCCESS');
-    expect(updatedTask?.stop_reason).toContain('running');
+  it('单次资源不足返回真实失败，不自动持续开机', async () => {
+    vi.mocked(harness.client.powerOn).mockRejectedValue(businessError('ResourceUnavailable', 'GPU资源不足', 'r2'));
+    const result = await harness.scheduler.requestPowerOn('pro-scarce');
+    expect(result).toMatchObject({ status: 'gpu_unavailable', retryable: true, code: 'ResourceUnavailable', request_id: 'r2' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(harness.client.powerOn).toHaveBeenCalledOnce();
+    expect(harness.store.getLatestTaskByInstance('pro-scarce')).toBeNull();
   });
 
-  it('场景 2: 首次开机因 GPU 资源不足失败，自动创建后台重试任务持久化到 SQLite', async () => {
-    vi.spyOn(mockClient, 'getStatus').mockResolvedValue('stopped');
-    vi.spyOn(mockClient, 'powerOn').mockRejectedValue(
-      new AutoDLRetryableError('当前机房 GPU 资源已满，请稍后重试')
-    );
-
-    const result = await scheduler.requestPowerOn('pro-test-retry');
-
-    // 立即向 Agent 返回结果，表明已建立后台任务
-    expect(result.isImmediateSuccess).toBe(false);
-    expect(result.message).toContain('后台持续开机任务');
-    expect(result.task.status).toBe('RETRYING');
-    expect(result.task.last_error).toContain('GPU 资源已满');
-
-    // 验证数据库持久化记录
-    const storedTask = taskStore.getTaskById(result.task.task_id);
-    expect(storedTask).not.toBeNull();
-    expect(storedTask?.status).toBe('RETRYING');
-    expect(storedTask?.next_retry_at).toBeGreaterThan(Date.now());
+  it('显式持续请求经历资源不足后成功；接受开机后只轮询', async () => {
+    vi.mocked(harness.client.powerOn)
+      .mockRejectedValueOnce(businessError('NoResource', 'GPU资源不足'))
+      .mockResolvedValue(success);
+    const result = harness.scheduler.requestPowerOnRetry('pro-retry');
+    expect(result.task.status).toBe('PENDING');
+    await flushWork();
+    expect(harness.store.getTaskById(result.task.task_id)).toMatchObject({ status: 'RETRYING', retry_count: 1 });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(harness.store.getTaskById(result.task.task_id)).toMatchObject({ phase: 'OBSERVE', retry_count: 2 });
+    vi.mocked(harness.client.getStatus).mockResolvedValue('running');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(harness.scheduler.getLatestTaskByInstance('pro-retry')).toMatchObject({ status: 'SUCCESS', retry_count: 2, next_retry_at: null, last_error: null });
+    expect(harness.client.powerOn).toHaveBeenCalledTimes(2);
   });
 
-  it('场景 3: 首次开机遇到鉴权失败或不可重试错误，立即抛出异常且不创建重试任务', async () => {
-    vi.spyOn(mockClient, 'getStatus').mockResolvedValue('stopped');
-    vi.spyOn(mockClient, 'powerOn').mockRejectedValue(
-      new AutoDLNonRetryableError('Token 鉴权失败，无权开机')
-    );
-
-    await expect(scheduler.requestPowerOn('pro-test-unauth')).rejects.toThrow(
-      'Token 鉴权失败'
-    );
-
-    // 确认数据库中没有留下残留任务
-    const activeTask = taskStore.getActiveTaskByInstance('pro-test-unauth');
-    expect(activeTask).toBeNull();
+  it('已 running 的持续任务直接完成，不发开机', async () => {
+    vi.mocked(harness.client.getStatus).mockResolvedValue('running');
+    const { task } = harness.scheduler.requestPowerOnRetry('pro-running');
+    await flushWork();
+    expect(harness.store.getTaskById(task.task_id)?.status).toBe('SUCCESS');
+    expect(harness.client.powerOn).not.toHaveBeenCalled();
   });
 
-  it('场景 4: 取消进行中的重试任务', async () => {
-    vi.spyOn(mockClient, 'getStatus').mockResolvedValue('stopped');
-    vi.spyOn(mockClient, 'powerOn').mockRejectedValue(
-      new AutoDLRetryableError('GPU 资源紧张')
-    );
+  it('永久错误立即停止，终态不能再被取消覆盖', async () => {
+    vi.mocked(harness.client.powerOn).mockRejectedValue(new AutoDLNonRetryableError('无权限'));
+    const { task } = harness.scheduler.requestPowerOnRetry('pro-denied');
+    await flushWork();
+    expect(harness.store.getTaskById(task.task_id)?.status).toBe('FAILED');
+    expect(harness.scheduler.cancelTask(task.task_id)).toBe(false);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(harness.client.powerOn).toHaveBeenCalledOnce();
+  });
 
-    const result = await scheduler.requestPowerOn('pro-test-cancel');
-    const taskId = result.task.task_id;
+  it('状态查询临时失败只能重查状态；永久错误不无限吞掉', async () => {
+    vi.mocked(harness.client.getStatus)
+      .mockRejectedValueOnce(new AutoDLRetryableError('HTTP 503'))
+      .mockRejectedValue(new AutoDLNonRetryableError('token 无效'));
+    const { task } = harness.scheduler.requestPowerOnRetry('pro-status');
+    await flushWork();
+    expect(harness.client.powerOn).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(harness.store.getTaskById(task.task_id)?.status).toBe('FAILED');
+  });
 
-    // 用户主动取消
-    const cancelled = scheduler.cancelTask(taskId, '用户不再需要该机器');
-    expect(cancelled).toBe(true);
+  it('开机网络结果不确定时仅核实状态，不在 stopped 上盲目重发', async () => {
+    vi.mocked(harness.client.powerOn).mockRejectedValue(new AutoDLRetryableError('timeout', { uncertain: true }));
+    const { task } = harness.scheduler.requestPowerOnRetry('pro-uncertain');
+    await flushWork();
+    expect(harness.store.getTaskById(task.task_id)?.phase).toBe('VERIFY');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(harness.client.powerOn).toHaveBeenCalledOnce();
+    expect(harness.store.getTaskById(task.task_id)?.status).toBe('FAILED');
+  });
 
-    const taskInDb = taskStore.getTaskById(taskId);
-    expect(taskInDb?.status).toBe('CANCELLED');
-    expect(taskInDb?.stop_reason).toBe('用户不再需要该机器');
+  it('未知或启动中的状态仅轮询，不把它猜成已停止', async () => {
+    vi.mocked(harness.client.getStatus).mockResolvedValue('provider_future_starting');
+    const { task } = harness.scheduler.requestPowerOnRetry('pro-unknown');
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(harness.client.powerOn).not.toHaveBeenCalled();
+    expect(harness.store.getTaskById(task.task_id)?.last_error).toContain('provider_future_starting');
+    vi.mocked(harness.client.getStatus).mockResolvedValue('running');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(harness.store.getTaskById(task.task_id)?.status).toBe('SUCCESS');
+  });
+
+  it('退避等待跨越截止时间也不会再发一次请求', async () => {
+    await harness.close();
+    harness = createHarness({ maxDurationMinutes: 0.005, initialIntervalSec: 1 });
+    vi.mocked(harness.client.powerOn).mockRejectedValue(businessError('Resource', 'GPU资源不足'));
+    const { task } = harness.scheduler.requestPowerOnRetry('pro-deadline');
+    await flushWork();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(harness.client.powerOn).toHaveBeenCalledOnce();
+    expect(harness.store.getTaskById(task.task_id)).toMatchObject({ status: 'TIMEOUT', next_retry_at: null });
+  });
+
+  it('状态请求过截止时间才返回 running 也不能成功或发开机', async () => {
+    await harness.close();
+    harness = createHarness({ maxDurationMinutes: 0.005 });
+    const gate = deferred<string>();
+    vi.mocked(harness.client.getStatus).mockReturnValue(gate.promise);
+    const { task } = harness.scheduler.requestPowerOnRetry('pro-late-deadline');
+    await flushWork();
+    await vi.advanceTimersByTimeAsync(500);
+    gate.resolve('running');
+    await flushWork();
+    expect(harness.store.getTaskById(task.task_id)?.status).toBe('TIMEOUT');
+    expect(harness.client.powerOn).not.toHaveBeenCalled();
+  });
+
+  it('退避增加但不超过配置最大间隔，计数包含每次实际开机尝试', async () => {
+    vi.mocked(harness.client.powerOn).mockRejectedValue(businessError('Resource', 'GPU资源不足'));
+    const { task } = harness.scheduler.requestPowerOnRetry('pro-backoff');
+    await flushWork();
+    for (const delay of [1000, 2000, 4000, 5000]) {
+      expect(harness.store.getTaskById(task.task_id)!.next_retry_at! - Date.now()).toBe(delay);
+      await vi.advanceTimersByTimeAsync(delay);
+    }
+    expect(harness.store.getTaskById(task.task_id)?.retry_count).toBe(5);
+  });
+
+  it('取消只取消持续请求，不自动关机', async () => {
+    const { task } = harness.scheduler.requestPowerOnRetry('pro-cancel');
+    expect(harness.scheduler.cancelTask(task.task_id)).toBe(true);
+    await flushWork();
+    expect(harness.store.getTaskById(task.task_id)?.status).toBe('CANCELLED');
+    expect(harness.client.powerOn).not.toHaveBeenCalled();
+    expect(harness.client.powerOff).not.toHaveBeenCalled();
   });
 });

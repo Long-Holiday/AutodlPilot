@@ -1,56 +1,45 @@
 import dotenv from 'dotenv';
 import { z } from 'zod';
-import path from 'path';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-// 加载环境变量
-dotenv.config();
+export const projectRoot = fileURLToPath(new URL('../../', import.meta.url));
 
 const configSchema = z.object({
-  // AutoDL 官方 API 配置
-  AUTODL_TOKEN: z.string().min(1, 'AUTODL_TOKEN 必须配置（请在 .env 文件中设置）'),
+  AUTODL_TOKEN: z.string().trim().min(1, '请在项目 .env 设置 AUTODL_TOKEN'),
   AUTODL_BASE_URL: z.string().url().default('https://api.autodl.com'),
-
-  // MCP 鉴权与 HTTP 服务配置
-  MCP_AUTH_TOKEN: z.string().min(6, 'MCP_AUTH_TOKEN 必须配置且长度不少于6位'),
-  PORT: z.coerce.number().int().positive().default(3000),
-  HOST: z.string().default('0.0.0.0'),
-
-  // SQLite 数据库路径
+  AUTODL_TIMEOUT_MS: z.coerce.number().int().positive().max(300000).default(15000),
+  MCP_AUTH_TOKEN: z.string().trim().min(6, 'MCP_AUTH_TOKEN 至少为 6 位'),
+  MCP_ALLOWED_ORIGINS: z.string().default('').transform((value) =>
+    value.split(',').map((origin) => origin.trim()).filter(Boolean)
+  ).pipe(z.array(z.string().url().refine((origin) => new URL(origin).origin === origin, '必须是不带路径的 Origin'))),
+  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  HOST: z.string().default('127.0.0.1'),
   DATABASE_PATH: z.string().default('./data/autodl-pilot.db'),
-
-  // 持续开机调度器配置（支持最长 2 小时持续重试与退避配合）
   RETRY_INITIAL_INTERVAL_SEC: z.coerce.number().positive().default(10),
   RETRY_MAX_INTERVAL_SEC: z.coerce.number().positive().default(120),
-  RETRY_BACKOFF_FACTOR: z.coerce.number().min(1.0).default(1.5),
-  RETRY_MAX_DURATION_MINUTES: z.coerce.number().positive().default(120),
-
-  // 开机后实例运行状态轮询配置
+  RETRY_BACKOFF_FACTOR: z.coerce.number().min(1).default(1.5),
+  RETRY_MAX_DURATION_MINUTES: z.coerce.number().positive().max(1440).default(120),
   POLL_STATUS_INTERVAL_SEC: z.coerce.number().positive().default(5),
   POLL_STATUS_TIMEOUT_SEC: z.coerce.number().positive().default(180),
-
-  // 日志配置
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
+}).refine((value) => value.RETRY_MAX_INTERVAL_SEC >= value.RETRY_INITIAL_INTERVAL_SEC, {
+  message: '最大重试间隔不能小于初始间隔', path: ['RETRY_MAX_INTERVAL_SEC'],
+}).refine((value) => value.AUTODL_TOKEN !== value.MCP_AUTH_TOKEN, {
+  message: 'MCP_AUTH_TOKEN 不得复用 AutoDL 开发者 token', path: ['MCP_AUTH_TOKEN'],
 });
 
 export type Config = z.infer<typeof configSchema>;
 
-function loadConfig(): Config {
-  const parsed = configSchema.safeParse(process.env);
+export function loadConfig(env: NodeJS.ProcessEnv = process.env, root = projectRoot): Config {
+  dotenv.config({ path: path.join(root, '.env'), processEnv: env, quiet: true });
+  const parsed = configSchema.safeParse(env);
   if (!parsed.success) {
-    console.error('❌ 配置校验失败:');
-    for (const issue of parsed.error.issues) {
-      console.error(`  - [${issue.path.join('.')}] ${issue.message}`);
-    }
-    process.exit(1);
+    // 不序列化输入，配置错误也不能打印实际密钥。
+    throw new Error(parsed.error.issues.map((issue) => `[${issue.path.join('.')}] ${issue.message}`).join('\n'));
   }
-
-  // 确保数据库路径的绝对路径计算正确
-  const config = parsed.data;
-  if (!path.isAbsolute(config.DATABASE_PATH)) {
-    config.DATABASE_PATH = path.resolve(process.cwd(), config.DATABASE_PATH);
-  }
-
-  return config;
+  return {
+    ...parsed.data,
+    DATABASE_PATH: path.resolve(root, parsed.data.DATABASE_PATH),
+  };
 }
-
-export const config = loadConfig();

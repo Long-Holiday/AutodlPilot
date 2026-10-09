@@ -1,32 +1,28 @@
-import { Request, Response, NextFunction } from 'express';
-import { config } from '../config/index.js';
-import { logger } from '../logger/index.js';
+import { timingSafeEqual, createHash } from 'node:crypto';
+import { RequestHandler } from 'express';
 
-/**
- * 校验请求的 MCP 访问 Token
- * 支持 Header: "Authorization: Bearer <token>" 或 URL Query: "?token=<token>"
- */
-export function mcpAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-  let clientToken: string | undefined;
+export function mcpAuthMiddleware(token: string): RequestHandler {
+  const expected = createHash('sha256').update(token).digest();
+  return (req, res, next) => {
+    const match = /^Bearer (\S+)$/.exec(req.headers.authorization ?? '');
+    const actual = createHash('sha256').update(match?.[1] ?? '').digest();
+    if (!match || !timingSafeEqual(expected, actual)) {
+      res.setHeader('WWW-Authenticate', 'Bearer');
+      res.status(401).json({ error: 'Unauthorized', message: '请在 Authorization 请求头携带 MCP Bearer Token' });
+      return;
+    }
+    next();
+  };
+}
 
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    clientToken = authHeader.substring(7).trim();
-  } else if (typeof req.query.token === 'string') {
-    clientToken = req.query.token.trim();
-  }
-
-  if (!clientToken || clientToken !== config.MCP_AUTH_TOKEN) {
-    logger.warn(
-      { ip: req.ip, path: req.path, method: req.method },
-      '拒绝未授权的 MCP 访问请求（Token 不匹配或未提供）'
-    );
-    res.status(401).json({
-      error: 'Unauthorized',
-      message: 'MCP 访问鉴权失败：请在 Authorization 请求头中携带有效的 Bearer Token',
-    });
-    return;
-  }
-
-  next();
+export function originMiddleware(allowedOrigins: string[] = []): RequestHandler {
+  const allowed = new Set(allowedOrigins);
+  return (req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin !== undefined && !allowed.has(origin)) {
+      res.status(403).json({ error: 'Forbidden', message: 'Origin 不在允许列表' });
+      return;
+    }
+    next();
+  };
 }
